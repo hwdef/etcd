@@ -45,9 +45,11 @@ var (
 	mixedTxnReadWriteRatio float64
 	mixedTxnRangeLimit     int64
 	mixedTxnEndKey         string
+	mixedTxnOpsPerTxn      int
 
-	writeOpsTotal uint64
-	readOpsTotal  uint64
+	writeOpsTotal      uint64
+	readOpsTotal       uint64
+	mixedTxnMixedTotal uint64
 )
 
 func init() {
@@ -62,11 +64,13 @@ func init() {
 	mixedTxnCmd.Flags().IntVar(&keySpaceSize, "key-space-size", 1, "Maximum possible keys")
 	mixedTxnCmd.Flags().StringVar(&rangeConsistency, "consistency", "l", "Linearizable(l) or Serializable(s)")
 	mixedTxnCmd.Flags().Float64Var(&mixedTxnReadWriteRatio, "rw-ratio", 1, "Read/write ops ratio")
+	mixedTxnCmd.Flags().IntVar(&mixedTxnOpsPerTxn, "txn-ops", 1, "Number of operations per transaction")
 }
 
 type request struct {
-	isWrite bool
-	op      v3.Op
+	ops      []v3.Op
+	readOps  int
+	writeOps int
 }
 
 func mixedTxnFunc(cmd *cobra.Command, _ []string) {
@@ -74,6 +78,14 @@ func mixedTxnFunc(cmd *cobra.Command, _ []string) {
 		fmt.Fprintf(os.Stderr, "expected positive --key-space-size, got (%v)", keySpaceSize)
 		os.Exit(1)
 	}
+	if mixedTxnOpsPerTxn <= 0 {
+		fmt.Fprintf(os.Stderr, "expected positive --txn-ops, got (%v)", mixedTxnOpsPerTxn)
+		os.Exit(1)
+	}
+
+	readOpsTotal = 0
+	writeOpsTotal = 0
+	mixedTxnMixedTotal = 0
 
 	if rangeConsistency == "l" {
 		fmt.Println("bench with linearizable range")
@@ -97,6 +109,7 @@ func mixedTxnFunc(cmd *cobra.Command, _ []string) {
 
 	reportRead := newReport(cmd.Name() + "-read")
 	reportWrite := newReport(cmd.Name() + "-write")
+	reportMixed := newReport(cmd.Name() + "-mixed-ops")
 	for i := range clients {
 		wg.Add(1)
 		go func(c *v3.Client) {
@@ -104,11 +117,16 @@ func mixedTxnFunc(cmd *cobra.Command, _ []string) {
 			for req := range requests {
 				limit.Wait(context.Background())
 				st := time.Now()
-				_, err := c.Txn(context.TODO()).Then(req.op).Commit()
-				if req.isWrite {
-					reportWrite.Results() <- report.Result{Err: err, Start: st, End: time.Now()}
-				} else {
-					reportRead.Results() <- report.Result{Err: err, Start: st, End: time.Now()}
+				_, err := c.Txn(context.TODO()).Then(req.ops...).Commit()
+
+				res := report.Result{Err: err, Start: st, End: time.Now()}
+				switch {
+				case req.readOps > 0 && req.writeOps == 0:
+					reportRead.Results() <- res
+				case req.writeOps > 0 && req.readOps == 0:
+					reportWrite.Results() <- res
+				default:
+					reportMixed.Results() <- res
 				}
 				bar.Increment()
 			}
@@ -116,22 +134,29 @@ func mixedTxnFunc(cmd *cobra.Command, _ []string) {
 	}
 
 	go func() {
+		readProbability := mixedTxnReadWriteRatio / (1 + mixedTxnReadWriteRatio)
 		for i := 0; i < mixedTxnTotal; i++ {
-			var req request
-			if rand.Float64() < mixedTxnReadWriteRatio/(1+mixedTxnReadWriteRatio) {
-				opts := []v3.OpOption{v3.WithRange(mixedTxnEndKey)}
-				if rangeConsistency == "s" {
-					opts = append(opts, v3.WithSerializable())
+			req := request{ops: make([]v3.Op, 0, mixedTxnOpsPerTxn)}
+			for j := 0; j < mixedTxnOpsPerTxn; j++ {
+				if rand.Float64() < readProbability {
+					opts := []v3.OpOption{v3.WithRange(mixedTxnEndKey)}
+					if rangeConsistency == "s" {
+						opts = append(opts, v3.WithSerializable())
+					}
+					opts = append(opts, v3.WithPrefix(), v3.WithLimit(mixedTxnRangeLimit))
+					req.ops = append(req.ops, v3.OpGet("", opts...))
+					req.readOps++
+					continue
 				}
-				opts = append(opts, v3.WithPrefix(), v3.WithLimit(mixedTxnRangeLimit))
-				req.op = v3.OpGet("", opts...)
-				req.isWrite = false
-				readOpsTotal++
-			} else {
-				binary.PutVarint(k, int64(i%keySpaceSize))
-				req.op = v3.OpPut(string(k), v)
-				req.isWrite = true
-				writeOpsTotal++
+
+				binary.PutVarint(k, int64(((i*mixedTxnOpsPerTxn)+j)%keySpaceSize))
+				req.ops = append(req.ops, v3.OpPut(string(k), v))
+				req.writeOps++
+			}
+			readOpsTotal += uint64(req.readOps)
+			writeOpsTotal += uint64(req.writeOps)
+			if req.readOps > 0 && req.writeOps > 0 {
+				mixedTxnMixedTotal++
 			}
 			requests <- req
 		}
@@ -140,12 +165,18 @@ func mixedTxnFunc(cmd *cobra.Command, _ []string) {
 
 	rcRead := reportRead.Run()
 	rcWrite := reportWrite.Run()
+	rcMixed := reportMixed.Run()
 	wg.Wait()
 	close(reportRead.Results())
 	close(reportWrite.Results())
+	close(reportMixed.Results())
 	bar.Finish()
 	fmt.Printf("Total Read Ops: %d\nDetails:", readOpsTotal)
 	fmt.Println(<-rcRead)
 	fmt.Printf("Total Write Ops: %d\nDetails:", writeOpsTotal)
 	fmt.Println(<-rcWrite)
+	if mixedTxnMixedTotal > 0 {
+		fmt.Printf("Transactions containing both read and write ops: %d\nDetails:", mixedTxnMixedTotal)
+		fmt.Println(<-rcMixed)
+	}
 }
